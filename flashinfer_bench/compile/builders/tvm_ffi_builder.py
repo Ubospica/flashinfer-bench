@@ -278,8 +278,9 @@ class TVMFFIBuilder(Builder):
         # Create metadata for the runnable
         metadata = RunnableMetadata(
             build_type="tvm_ffi",
-            definition=definition.name,
-            solution=solution.name,
+            definition_name=definition.name,
+            solution_name=solution.name,
+            destination_passing_style=solution.spec.destination_passing_style,
             misc={
                 # Provide the definition object to handle value-returning style
                 "definition": definition,
@@ -293,12 +294,5 @@ class TVMFFIBuilder(Builder):
         except AttributeError as e:
             raise BuildError(f"Entry point '{entry_symbol}' not found in module") from e
 
-        # Create keyword adapter to match definition interface
-        arg_order = list(definition.inputs.keys()) + list(definition.outputs.keys())
-
-        def kwargs_adapter(**kwargs):
-            args = [kwargs[name] for name in arg_order]
-            return callable(*args)
-
         cleaner = self._get_cleaner(build_path)
-        return Runnable(callable=kwargs_adapter, metadata=metadata, cleaner=cleaner)
+        return Runnable(callable=callable, metadata=metadata, cleaner=cleaner)

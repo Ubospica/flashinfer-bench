@@ -22,14 +22,14 @@ def apply(
 def apply(
     def_name_or_resolver: Union[str, Callable[..., str]],
     *,
-    runtime_kwargs: Dict[str, Any],
-    fallback: Optional[Callable[..., Any]],
+    args: Tuple[Any, ...],
+    fallback: Optional[Callable[..., Any]] = None,
 ) -> Any: ...
 
 
 def apply(
     def_name_or_resolver: Union[str, Callable[..., str]],
-    runtime_kwargs: Optional[Dict[str, Any]] = None,
+    args: Optional[Tuple[Any, ...]] = None,
     fallback: Optional[Callable[..., Any]] = None,
 ):
     """
@@ -86,7 +86,7 @@ def apply(
     ... )
     """
     # Imperative
-    if runtime_kwargs is not None:
+    if args is not None:
         kwargs = dict(runtime_kwargs)
         def_name = (
             def_name_or_resolver

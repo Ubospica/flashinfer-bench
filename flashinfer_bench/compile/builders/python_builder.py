@@ -140,9 +140,14 @@ class PythonBuilder(Builder):
 
         metadata = RunnableMetadata(
             build_type="python",
-            definition=definition.name,
-            solution=solution.name,
-            misc={"module": module_name, "entry_symbol": entry_symbol},
+            definition_name=definition.name,
+            solution_name=solution.name,
+            destination_passing_style=solution.spec.destination_passing_style,
+            misc={
+                "definition": definition,
+                "module_name": module_name,
+                "entry_symbol": entry_symbol,
+            },
         )
 
         return Runnable(callable=fn, metadata=metadata, cleaner=cleaner)

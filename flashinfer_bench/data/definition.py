@@ -3,7 +3,7 @@
 import ast
 from enum import Enum
 from functools import cached_property
-from typing import Dict, List, Literal, Optional, Tuple, Union
+from typing import Dict, Iterable, List, Literal, Optional, Tuple, Union
 
 from pydantic import BaseModel, Field, model_validator
 
@@ -36,7 +36,7 @@ class AxisVar(BaseModel):
 
     type: Literal["var"] = "var"
     """The type identifier for variable axes."""
-    description: Optional[str] = None
+    description: Optional[str] = Field(default=None)
     """An optional human-readable description explaining the purpose of this axis."""
 
 
@@ -117,12 +117,12 @@ class Definition(BaseModelWithDocstrings):
     """Reference implementation code. It defines the compute logic of the kernel. Must be a valid
     Python code with a 'run' function that takes the input tensors and returns the output tensors.
     """
-    tags: Optional[List[NonEmptyString]] = Field(default=None)
+    tags: List[NonEmptyString] = Field(default_factory=list)
     """Optional list of tags for grouping and filtering kernels. It's used in the FlashInfer-Bench
     website."""
     description: Optional[str] = Field(default=None)
     """Optional human-readable description of the kernel's purpose."""
-    constraints: Optional[List[NonEmptyString]] = Field(default=None)
+    constraints: List[NonEmptyString] = Field(default_factory=list)
     """Optional list of constraint expressions describing relationships between axes."""
 
     @model_validator(mode="after")
@@ -236,13 +236,13 @@ class Definition(BaseModelWithDocstrings):
                     bindings[axis] = (inp_name, dim_idx)
         return bindings
 
-    def get_var_values(self, input_shapes: Dict[str, List[int]]) -> Dict[str, int]:
+    def get_var_values(self, input_shapes: Iterable[Optional[Tuple[int, ...]]]) -> Dict[str, int]:
         """Get concrete variable axis values from input shapes.
 
         Parameters
         ----------
-        input_shapes : Dict[str, List[int]]
-            Dictionary mapping input tensor names to their concrete shapes.
+        input_shapes : Iterable[Optional[Tuple[int, ...]]]
+            Iterable of input tensor shapes.
 
         Returns
         -------
@@ -256,20 +256,24 @@ class Definition(BaseModelWithDocstrings):
             multiple input tensors, but the values are not consistent.
         """
         var_values: Dict[str, int] = {}
-        for name, spec in self.inputs.items():
-            if spec.shape is None:  # scalar, no shape
+        for (inp_name, inp_spec), inp_shape in zip(self.inputs.items(), input_shapes):
+            if inp_spec.shape is None:  # scalar, no shape
                 continue
-            for dim_idx, axis_name in enumerate(spec.shape):
+            if len(inp_spec.shape) != len(inp_shape):
+                raise ValueError(
+                    f"Input '{inp_name}''s defined dimension is {len(inp_spec.shape)} but the "
+                    f"actual dimension is {len(inp_shape)}"
+                )
+            for axis_name, axis_value in zip(inp_spec.shape, inp_shape):
                 if axis_name in self.axes and self.axes[axis_name].type == "var":
-                    cur_axis_value = input_shapes[name][dim_idx]
                     if axis_name in var_values:
-                        if var_values[axis_name] != cur_axis_value:
+                        if var_values[axis_name] != axis_value:
                             raise ValueError(
                                 f"Axis '{axis_name}' has different values for different input "
-                                f"tensors: {var_values[axis_name]} and {cur_axis_value}"
+                                f"tensors: {var_values[axis_name]} and {axis_value}"
                             )
                     else:
-                        var_values[axis_name] = cur_axis_value
+                        var_values[axis_name] = axis_value
 
         if len(var_values) != len(self.var_axes):
             raise ValueError(
@@ -279,22 +283,21 @@ class Definition(BaseModelWithDocstrings):
         return var_values
 
     def _get_shapes(
-        self, tensors: Dict[str, TensorSpec], var_values: Optional[Dict[str, int]] = None
-    ) -> Dict[str, List[int]]:
+        self, tensors: Iterable[TensorSpec], var_values: Optional[Dict[str, int]] = None
+    ) -> List[Optional[Tuple[int, ...]]]:
         """Get concrete tensor shapes given variable axis values.
 
         Parameters
         ----------
-        tensors : Dict[str, TensorSpec]
-            Dictionary of tensor specifications to compute shapes for.
+        tensors : List[TensorSpec]
+            List of tensor specifications to compute shapes for.
         var_values : Optional[Dict[str, int]], default=None
             Values for variable axes. If None, defaults to empty dictionary.
 
         Returns
         -------
-        Dict[str, List[int]]
-            Dictionary mapping tensor names to their concrete shapes as lists of integers.
-            Scalar tensors (shape=None) are excluded from the result.
+        List[Optional[Tuple[int, ...]]]
+            List of concrete shapes as tuples of integers. None for scalar tensors.
 
         Raises
         ------
@@ -302,9 +305,9 @@ class Definition(BaseModelWithDocstrings):
             If a required variable axis value is missing from var_values.
         """
         var_values = var_values or {}
-        shapes = {}
+        shapes = []
 
-        for tensor_name, tensor_spec in tensors.items():
+        for tensor_spec in tensors:
             if tensor_spec.shape is None:  # scalar, no shape
                 continue
             shape = []
@@ -316,11 +319,13 @@ class Definition(BaseModelWithDocstrings):
                     if axis_name not in var_values:
                         raise ValueError(f"Missing value for variable axis '{axis_name}'")
                     shape.append(var_values[axis_name])
-            shapes[tensor_name] = shape
+            shapes.append(shape)
 
         return shapes
 
-    def get_input_shapes(self, var_values: Optional[Dict[str, int]] = None) -> Dict[str, List[int]]:
+    def get_input_shapes(
+        self, var_values: Optional[Dict[str, int]] = None
+    ) -> List[Optional[Tuple[int, ...]]]:
         """Get concrete input shapes given variable axis values.
 
         Parameters
@@ -338,11 +343,11 @@ class Definition(BaseModelWithDocstrings):
         ValueError
             If a required variable axis value is missing from var_values.
         """
-        return self._get_shapes(self.inputs, var_values)
+        return self._get_shapes(self.inputs.values(), var_values)
 
     def get_output_shapes(
         self, var_values: Optional[Dict[str, int]] = None
-    ) -> Dict[str, List[int]]:
+    ) -> List[Optional[Tuple[int, ...]]]:
         """Get concrete output shapes given variable axis values.
 
         Parameters
@@ -360,4 +365,4 @@ class Definition(BaseModelWithDocstrings):
         ValueError
             If a required variable axis value is missing from var_values.
         """
-        return self._get_shapes(self.outputs, var_values)
+        return self._get_shapes(self.outputs.values(), var_values)

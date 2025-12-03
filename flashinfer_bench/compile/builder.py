@@ -29,6 +29,12 @@ class Builder(ABC):
     `package_name` is a unique name created from the solution.
     """
 
+    _package_prefix: str
+    """The prefix to prepend to the package name."""
+
+    _build_dir_name: str
+    """The name of the build subdirectory of the concrete builder."""
+
     def __init__(self, package_prefix: str, build_dir_name: str) -> None:
         """Initialize the builder.
 

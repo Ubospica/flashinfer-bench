@@ -2,12 +2,16 @@
 
 from __future__ import annotations
 
-from typing import Any, Callable, Dict, Literal, Optional, Union
+from functools import cached_property
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Literal, Optional, Union
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from flashinfer_bench.data import Definition
 from flashinfer_bench.utils import dtype_str_to_torch_dtype
+
+if TYPE_CHECKING:
+    import torch
 
 
 class RunnableMetadata(BaseModel):
@@ -20,11 +24,16 @@ class RunnableMetadata(BaseModel):
     build_type: Union[Literal["torch", "tvm_ffi", "python", "triton"], str]
     """The type of build that produced this runnable (e.g., 'python', 'torch', 'triton',
     'tvm_ffi')."""
-    definition: str
+    definition_name: str
     """Name of the definition that specifies the expected interface."""
-    solution: str
+    solution_name: str
     """Name of the solution that was compiled into this runnable."""
-    misc: Dict[str, Any]
+    destination_passing_style: bool = True
+    """Whether the runnable uses destination-passing style."""
+    definition: Optional[Definition] = None
+    """The full definition that was used to build the runnable. It's not necessary to be set, but
+    required when calling in keyword passing style and value-returning style."""
+    misc: Dict[str, Any] = Field(default_factory=dict)
     """Miscellaneous metadata about the runnable. Contents vary by builder type."""
 
 
@@ -65,8 +74,8 @@ class Runnable:
         self.metadata = metadata
         self._cleaner = cleaner
 
-    def __call__(self, **kwargs: Any) -> Any:
-        """Execute the runnable with keyword arguments.
+    def __call__(self, *args: Any) -> Any:
+        """Execute the runnable with positional and keyword arguments.
 
         This method calls the underlying compiled function with the provided inputs.
         If the function returns a single-element tuple, it is automatically unpacked
@@ -74,8 +83,8 @@ class Runnable:
 
         Parameters
         ----------
-        kwargs : Any
-            Keyword arguments for the underlying function.
+        args : Any
+            Positional arguments for the underlying function.
 
         Returns
         -------
@@ -83,12 +92,45 @@ class Runnable:
             The result of the underlying function. Single-element tuples are unpacked
             to scalar values.
         """
-        ret = self._callable(**kwargs)
+        ret = self._callable(*args)
         if isinstance(ret, tuple) and len(ret) == 1:
             return ret[0]
         return ret
 
-    def call_value_returning(self, **kwargs: Any) -> Any:
+    @cached_property
+    def _arg_names(self) -> List[str]:
+        """Get the order of arguments for the underlying function."""
+        if self.metadata.definition is None:
+            raise ValueError(
+                "When calling in keyword passing style, metadata.full_definition must " "be set."
+            )
+        definition: Definition = self.metadata.definition
+        if self.metadata.destination_passing_style:
+            return list(definition.inputs.keys()) + list(definition.outputs.keys())
+        else:
+            return list(definition.inputs.keys())
+
+    def call_kwargs(self, **kwargs: Any) -> Any:
+        """Call the runnable with keyword arguments.
+
+        This method calls the underlying compiled function with the provided inputs.
+        If the function returns a single-element tuple, it is automatically unpacked
+        to a scalar value for convenience.
+        """
+        args = [kwargs[name] for name in self._arg_names]
+        return self(*args)
+
+    @cached_property
+    def _output_dtype_list(self) -> List["torch.dtype"]:
+        """Get the list of output data types."""
+        if self.metadata.definition is None:
+            raise ValueError(
+                "When calling in value-returning style, metadata.definition must " "be set."
+            )
+        definition = self.metadata.definition
+        return [dtype_str_to_torch_dtype(output.dtype) for output in definition.outputs.values()]
+
+    def call_value_returning(self, *args: Any) -> Any:
         """Call a destination-passing style (DPS) function in value-returning style.
 
         Some solutions use the destination-passing style,
@@ -120,36 +162,30 @@ class Runnable:
         """
         import torch
 
-        if "definition" not in self.metadata.misc or not isinstance(
-            self.metadata.misc["definition"], Definition
-        ):
+        if self.metadata.definition is None:
             raise ValueError(
-                "When calling in destination passing style, metadata.misc must "
-                "contain the full definition."
+                "When calling in value-returning style, metadata.definition must " "be set."
             )
-        definition: Definition = self.metadata.misc["definition"]
+        definition = self.metadata.definition
 
         # Allocate output tensors first
         var_values = definition.get_var_values(
-            {name: list(tensor.shape) for name, tensor in kwargs.items()}
+            (tensor.shape if isinstance(tensor, torch.Tensor) else None for tensor in args)
         )
         output_shapes = definition.get_output_shapes(var_values)
-        output_tensors: Dict[str, torch.Tensor] = {}
 
         # Determine device from input tensors
-        devices = {v.device for v in kwargs.values() if hasattr(v, "device")}
-        if len(devices) > 1:
-            raise ValueError("All input tensors must be on the same device")
-        device = devices.pop() if devices else "cpu"
+        device = next((v.device for v in args if hasattr(v, "device")), "cpu")
+        dtype_list = self._output_dtype_list
 
-        for name, shape in output_shapes.items():
-            output_tensors[name] = torch.empty(
-                shape, dtype=dtype_str_to_torch_dtype(definition.outputs[name].dtype)
-            ).to(device)
+        output_tensors: List[torch.Tensor] = []
+        for shape, dtype in zip(output_shapes, dtype_list):
+            shape = shape if shape is not None else ()
+            output_tensors.append(torch.empty(shape, dtype=dtype, device=device))
 
-        self._callable(**kwargs, **output_tensors)
+        self._callable(*args, *output_tensors)
 
-        results = tuple(output_tensors.values())
+        results = tuple(output_tensors)
         if len(results) == 0:
             return None
         if len(results) == 1:

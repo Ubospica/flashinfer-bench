@@ -2,7 +2,7 @@ import atexit
 import signal
 import threading
 import uuid
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import torch
 
@@ -94,7 +94,7 @@ class TracingRuntime:
 
         install_flashinfer_integrations()
 
-    def collect(self, def_name: str, runtime_args: Dict[str, Any]):
+    def collect(self, def_name: str, args: Iterable[Any]):
         """
         Record a workload for later serialization to disk.
 
@@ -102,8 +102,8 @@ class TracingRuntime:
         ----------
         def_name : str
             Name of the workload definition to trace.
-        runtime_args : Dict[str, Any]
-            Runtime arguments containing tensor inputs and other parameters.
+        args : Iterable[Any]
+            Positional arguments following the definition.
 
         Notes
         -----

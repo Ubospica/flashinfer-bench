@@ -15,7 +15,7 @@ def test_runnable_single_tuple_unpack_and_close_idempotent():
         calls["closed"] += 1
 
     metadata = RunnableMetadata(
-        build_type="python", definition="test", solution="test", misc={"k": 1}
+        build_type="python", definition_name="test", solution_name="test", misc={"k": 1}
     )
 
     r = Runnable(callable=fn, cleaner=closer, metadata=metadata)
