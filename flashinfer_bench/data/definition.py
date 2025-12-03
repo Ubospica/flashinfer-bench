@@ -257,7 +257,7 @@ class Definition(BaseModelWithDocstrings):
         """
         var_values: Dict[str, int] = {}
         for (inp_name, inp_spec), inp_shape in zip(self.inputs.items(), input_shapes):
-            if inp_spec.shape is None:  # scalar, no shape
+            if inp_spec.shape is None:
                 continue
             if len(inp_spec.shape) != len(inp_shape):
                 raise ValueError(
