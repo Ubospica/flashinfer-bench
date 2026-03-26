@@ -71,36 +71,30 @@ def _build_ranking_groups(
 
 
 def _compute_ranking_from_groups(
-    groups: Dict[tuple, Dict[str, float]],
-    baseline_author: str = "flashinfer",
-    sample_count: int = 200,
+    groups: Dict[tuple, Dict[str, float]], baseline_author: str = "flashinfer"
 ) -> List[Dict[str, Any]]:
-    """Compute author fast@p AUC rankings from pre-built workload groups.
+    """Compute author rankings by average speedup from pre-built workload groups.
 
     Parameters
     ----------
-    groups:
+    groups : Dict[tuple, Dict[str, float]]
         Output of :func:`_build_ranking_groups`.
-    baseline_author:
+    baseline_author : str
         Author whose latency is used as the baseline. Falls back to the fastest
         author in each group when the baseline author is absent.
-    sample_count:
-        Number of evenly-spaced p values used for AUC integration.
 
     Returns
     -------
     List[Dict[str, Any]]
-        List of dicts sorted by ``auc`` descending. Each dict contains:
+        List of dicts sorted by ``avg_speedup`` descending. Each dict contains:
 
         - ``author`` – author name
-        - ``auc`` – area under the fast@p curve (1.0 = always faster than baseline)
+        - ``avg_speedup`` – arithmetic mean of ``baseline_latency / author_latency``
         - ``n_comparisons`` – number of workload groups included
         - ``fast_at_1x`` – fraction of groups where this author beats the baseline
     """
     if not groups:
         return []
-
-    import numpy as np
 
     ratios_by_author: Dict[str, List[float]] = defaultdict(list)
     totals_by_author: Dict[str, int] = defaultdict(int)
@@ -124,34 +118,15 @@ def _compute_ranking_from_groups(
     if not ratios_by_author:
         return []
 
-    all_ratios = sorted({r for rs in ratios_by_author.values() for r in rs})
-    p_min = 0.0
-    p_max = max(all_ratios) if all_ratios else 2.0
-    sample_pts = sorted(set(np.linspace(p_min, p_max, sample_count).tolist()) | set(all_ratios))
-
-    def _auc(ratios: List[float], p_grid: List[float], total: int) -> float:
-        if not ratios or total == 0 or len(p_grid) < 2:
-            return 0.0
-        rs = sorted(ratios)
-        n = len(rs)
-        points = []
-        idx = 0
-        for p in p_grid:
-            while idx < n and rs[idx] <= p:
-                idx += 1
-            points.append((p, (n - idx) / total))
-        area = 0.0
-        for i in range(1, len(points)):
-            p1, w1 = points[i - 1]
-            p2, w2 = points[i]
-            area += (p2 - p1) * (w1 + w2) / 2
-        span = p_grid[-1] - p_grid[0]
-        return area / span if span > 0 else 0.0
-
     def _fast_at_p(ratios: List[float], p: float, total: int) -> float:
         if not ratios or total == 0:
             return 0.0
         return sum(1 for r in ratios if r > p) / total
+
+    def _avg_speedup(ratios: List[float], total: int) -> float:
+        if not ratios or total == 0:
+            return 0.0
+        return sum(ratios) / total
 
     rankings = []
     for author, ratios in ratios_by_author.items():
@@ -159,13 +134,13 @@ def _compute_ranking_from_groups(
         rankings.append(
             {
                 "author": author,
-                "auc": _auc(ratios, sample_pts, total),
+                "avg_speedup": _avg_speedup(ratios, total),
                 "n_comparisons": total,
                 "fast_at_1x": _fast_at_p(ratios, 1.0, total),
             }
         )
 
-    rankings.sort(key=lambda x: x["auc"], reverse=True)
+    rankings.sort(key=lambda x: x["avg_speedup"], reverse=True)
     return rankings
 
 
@@ -462,7 +437,7 @@ class TraceSet:
             - min_latency_ms: Minimum latency among successful traces (None if no successful traces)
             - max_latency_ms: Maximum latency among successful traces (None if no successful traces)
             - avg_latency_ms: Average latency among successful traces (None if no successful traces)
-            - rankings: List of dicts with author ranking by AUC of fast@p curve
+            - rankings: List of dicts with author ranking by average speedup
         """
         all_traces = [t for traces in self.traces.values() for t in traces]
 
@@ -500,37 +475,34 @@ class TraceSet:
         }
 
     def compute_fast_at_p_ranking(
-        self, baseline_author: str = "flashinfer", sample_count: int = 200
+        self, baseline_author: str = "flashinfer"
     ) -> List[Dict[str, Any]]:
-        """Compute author rankings based on area under the fast@p curve (all kernels).
+        """Compute author rankings based on average speedup (all kernels).
 
         For each workload group (same definition + workload.uuid), a baseline latency is
         identified (preferring the baseline_author; falling back to the fastest run).
         For each other author A with latency L_A and baseline L_B, the ratio r = L_B / L_A
-        is computed. fast@p is the fraction of groups where r > p. The AUC of this curve
-        (integrated over p) is used as the ranking score ("avg speedup").
+        is computed. The ranking score is the arithmetic mean of these ratios.
 
         Parameters
         ----------
         baseline_author : str
             Author name to use as baseline (default: 'flashinfer').
-        sample_count : int
-            Number of evenly-spaced p values for AUC integration (default: 200).
 
         Returns
         -------
         List[Dict[str, Any]]
-            List of dicts sorted by auc descending, each containing:
+            List of dicts sorted by avg_speedup descending, each containing:
             - author: str
-            - auc: float  (area under fast@p curve; 1.0 means always faster than baseline)
+            - avg_speedup: float  (mean baseline_latency / author_latency)
             - n_comparisons: int  (number of workload groups compared)
             - fast_at_1x: float  (fraction of groups faster than baseline, i.e. win@1.0)
         """
         groups = _build_ranking_groups(self.traces, self._solution_by_name)
-        return _compute_ranking_from_groups(groups, baseline_author, sample_count)
+        return _compute_ranking_from_groups(groups, baseline_author)
 
     def compute_fast_at_p_ranking_by_name(
-        self, def_name: str, baseline_author: str = "flashinfer", sample_count: int = 200
+        self, def_name: str, baseline_author: str = "flashinfer"
     ) -> List[Dict[str, Any]]:
         """Compute author rankings scoped to a single kernel definition.
 
@@ -543,8 +515,6 @@ class TraceSet:
             Name of the kernel definition (must exist in ``self.definitions``).
         baseline_author : str
             Author name to use as baseline (default: 'flashinfer').
-        sample_count : int
-            Number of evenly-spaced p values for AUC integration (default: 200).
 
         Returns
         -------
@@ -559,10 +529,10 @@ class TraceSet:
         if def_name not in self.definitions:
             raise KeyError(f"Unknown definition: {def_name!r}")
         groups = _build_ranking_groups(self.traces, self._solution_by_name, def_names={def_name})
-        return _compute_ranking_from_groups(groups, baseline_author, sample_count)
+        return _compute_ranking_from_groups(groups, baseline_author)
 
     def compute_fast_at_p_ranking_by_op_type(
-        self, op_type: str, baseline_author: str = "flashinfer", sample_count: int = 200
+        self, op_type: str, baseline_author: str = "flashinfer"
     ) -> List[Dict[str, Any]]:
         """Compute author rankings scoped to all kernels of a given op_type.
 
@@ -575,8 +545,6 @@ class TraceSet:
             Operation type string (e.g. ``'gqa_paged'``, ``'moe'``, ``'rmsnorm'``).
         baseline_author : str
             Author name to use as baseline (default: 'flashinfer').
-        sample_count : int
-            Number of evenly-spaced p values for AUC integration (default: 200).
 
         Returns
         -------
@@ -588,7 +556,7 @@ class TraceSet:
         if not def_names:
             return []
         groups = _build_ranking_groups(self.traces, self._solution_by_name, def_names=def_names)
-        return _compute_ranking_from_groups(groups, baseline_author, sample_count)
+        return _compute_ranking_from_groups(groups, baseline_author)
 
     def backup_traces(self) -> None:
         """Backup the traces directory to a new directory. This is useful when we want to keep the

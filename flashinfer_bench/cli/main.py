@@ -66,12 +66,12 @@ def summary(args: argparse.Namespace):
         rankings = s.get("rankings", [])
         if rankings:
             logger.info("")
-            logger.info("Author Rankings (by area under fast@p curve):")
+            logger.info("Author Rankings (by average speedup):")
             logger.info(
                 "  %-4s  %-24s  %-10s  %-14s  %-12s",
                 "Rank",
                 "Author",
-                "AUC Score",
+                "Avg Speedup",
                 "Fast@1x (>base)",
                 "Comparisons",
             )
@@ -81,14 +81,12 @@ def summary(args: argparse.Namespace):
                     "  %-4d  %-24s  %-10.4f  %-14.1f  %-12d",
                     rank,
                     entry["author"],
-                    entry["auc"],
+                    entry["avg_speedup"],
                     entry["fast_at_1x"] * 100,
                     entry["n_comparisons"],
                 )
             logger.info("")
-            logger.info(
-                "  AUC: area under fast@p curve (higher = faster vs baseline across workloads)"
-            )
+            logger.info("  Avg Speedup: mean of baseline_latency / author_latency")
             logger.info("  Fast@1x: fraction of workloads where this author beats the baseline")
         else:
             logger.info("(No author ranking data available — run with multiple solutions)")
