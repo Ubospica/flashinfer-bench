@@ -120,5 +120,75 @@ def test_trace_set_from_path_and_queries(tmp_path: Path):
     assert summary["max_latency_ms"] == 1.0
 
 
+def test_trace_set_ranking_uses_avg_speedup():
+    definition = Definition(
+        name="d1",
+        op_type="op",
+        axes={"M": AxisVar()},
+        inputs={"A": TensorSpec(shape=["M"], dtype="float32")},
+        outputs={"B": TensorSpec(shape=["M"], dtype="float32")},
+        reference="def run(a):\n    return a\n",
+    )
+
+    def make_solution(name: str, author: str) -> Solution:
+        return Solution(
+            name=name,
+            definition="d1",
+            author=author,
+            spec=BuildSpec(
+                language=SupportedLanguages.PYTHON,
+                target_hardware=["cpu"],
+                entry_point="main.py::run",
+            ),
+            sources=[SourceFile(path="main.py", content="def run():\n    pass\n")],
+        )
+
+    def make_trace(solution: str, uuid: str, latency_ms: float) -> Trace:
+        return Trace(
+            definition="d1",
+            workload=Workload(axes={"M": 2}, inputs={"A": RandomInput()}, uuid=uuid),
+            solution=solution,
+            evaluation=Evaluation(
+                status=EvaluationStatus.PASSED,
+                log="log",
+                environment=Environment(hardware="cpu"),
+                timestamp="t",
+                correctness=Correctness(max_relative_error=0.0, max_absolute_error=0.0),
+                performance=Performance(
+                    latency_ms=latency_ms, reference_latency_ms=latency_ms, speedup_factor=1.0
+                ),
+            ),
+        )
+
+    trace_set = TraceSet(
+        definitions={"d1": definition},
+        solutions={
+            "d1": [
+                make_solution("baseline", "flashinfer"),
+                make_solution("alice", "alice"),
+                make_solution("bob", "bob"),
+            ]
+        },
+        traces={
+            "d1": [
+                make_trace("baseline", "w1", 10.0),
+                make_trace("alice", "w1", 5.0),
+                make_trace("bob", "w1", 20.0),
+                make_trace("baseline", "w2", 8.0),
+                make_trace("alice", "w2", 8.0),
+                make_trace("bob", "w2", 4.0),
+            ]
+        },
+    )
+
+    rankings = trace_set.compute_fast_at_p_ranking()
+
+    assert [entry["author"] for entry in rankings] == ["alice", "bob"]
+    assert rankings[0]["avg_speedup"] == pytest.approx(1.5)
+    assert rankings[0]["fast_at_1x"] == pytest.approx(0.5)
+    assert rankings[0]["n_comparisons"] == 2
+    assert rankings[1]["avg_speedup"] == pytest.approx(1.25)
+
+
 if __name__ == "__main__":
     pytest.main(sys.argv)
