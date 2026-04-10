@@ -218,11 +218,22 @@ class DsaTopkIndexerEvaluator(DefaultEvaluator):
         device: str,
         trace_set_root: Optional[Path] = None,
     ) -> DeviceBaseline:
+        timing_lines: List[str] = ["[baseline]"]
+
+        start_time = time.perf_counter()
         ref_runnable = BuilderRegistry.get_instance().build_reference(definition)
+        timing_lines.append(
+            f"  build_reference:    {(time.perf_counter() - start_time) * 1000.0:.2f} ms"
+        )
+
+        start_time = time.perf_counter()
         loaded_safe_tensors = (
             load_safetensors(definition, workload, trace_set_root)
             if any(d.type == "safetensors" for d in workload.inputs.values())
             else {}
+        )
+        timing_lines.append(
+            f"  load_safetensors:   {(time.perf_counter() - start_time) * 1000.0:.2f} ms"
         )
 
         page_size = definition.axes["page_size"].value
@@ -238,28 +249,58 @@ class DsaTopkIndexerEvaluator(DefaultEvaluator):
         outputs: List[List[torch.Tensor]] = []
         dev = torch.device(device)
 
+        total_gen_inputs_ms = 0.0
+        total_pack_fp8_ms = 0.0
+        total_reference_run_ms = 0.0
+        total_normalize_ms = 0.0
+
         for _ in range(cfg.num_trials):
+            torch.cuda.synchronize(device)
+            start_time = time.perf_counter()
             inp = gen_inputs(definition, workload, device=device, safe_tensors=loaded_safe_tensors)
+            torch.cuda.synchronize(device)
+            total_gen_inputs_ms += (time.perf_counter() - start_time) * 1000.0
 
             if k_cache_is_random:
                 num_pages = inp[k_cache_idx].shape[0]
                 k_bf16 = torch.randn(
                     num_pages, page_size, 1, head_dim, dtype=torch.bfloat16, device=dev
                 )
+                torch.cuda.synchronize(device)
+                start_time = time.perf_counter()
                 inp[k_cache_idx] = _pack_fp8_k_cache(k_bf16, page_size, head_dim)
+                torch.cuda.synchronize(device)
+                total_pack_fp8_ms += (time.perf_counter() - start_time) * 1000.0
 
             inputs.append(inp)
+            torch.cuda.synchronize(device)
+            start_time = time.perf_counter()
             with torch.no_grad():
                 result = ref_runnable(*inp)
             torch.cuda.synchronize(device)
+            total_reference_run_ms += (time.perf_counter() - start_time) * 1000.0
+
+            torch.cuda.synchronize(device)
+            start_time = time.perf_counter()
             outputs.append(normalize_result(definition, result, device))
+            torch.cuda.synchronize(device)
+            total_normalize_ms += (time.perf_counter() - start_time) * 1000.0
+
+        timing_lines.append(f"  gen_inputs_total:   {total_gen_inputs_ms:.2f} ms")
+        timing_lines.append(f"  pack_fp8_total:    {total_pack_fp8_ms:.2f} ms")
+        timing_lines.append(f"  reference_run:     {total_reference_run_ms:.2f} ms")
+        timing_lines.append(f"  normalize_ref:     {total_normalize_ms:.2f} ms")
 
         if cfg.profile_baseline:
             latencies: List[float] = []
+            start_time = time.perf_counter()
             for inp in inputs:
                 ms = time_runnable(ref_runnable, inp, cfg.warmup_runs, cfg.iterations, device)
                 latencies.append(ms)
             mean_latency_ms = sum(latencies) / float(len(latencies))
+            timing_lines.append(
+                f"  profile_baseline:   {(time.perf_counter() - start_time) * 1000.0:.2f} ms"
+            )
         else:
             mean_latency_ms = 0.0
 
@@ -271,6 +312,7 @@ class DsaTopkIndexerEvaluator(DefaultEvaluator):
             inputs=inputs,
             outputs=outputs,
             mean_latency_ms=mean_latency_ms,
+            timing_log="\n".join(timing_lines),
         )
 
     @override

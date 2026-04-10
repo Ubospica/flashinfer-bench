@@ -32,6 +32,7 @@ class DeviceBaseline:
     inputs: List[List[Any]]
     outputs: List[List[torch.Tensor]]
     mean_latency_ms: float
+    timing_log: str = ""
 
 
 class Runner(ABC):

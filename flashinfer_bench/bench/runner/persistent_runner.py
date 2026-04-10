@@ -62,6 +62,7 @@ class PersistentSubprocessWorker:
         """
         self._device = device
         self._baselines: Dict[BaselineHandle, DeviceBaseline] = {}
+        self._baseline_timing_logs: Dict[BaselineHandle, str] = {}
         self._registry = BuilderRegistry.get_instance()
 
         # Solution failure tracking
@@ -249,6 +250,7 @@ class PersistentSubprocessWorker:
         cfg: BenchmarkConfig,
         trace_set_root: Optional[Path] = None,
     ) -> BaselineHandle:
+        start_time = time.perf_counter()
         evaluator_cls = resolve_evaluator(definition)
         baseline = evaluator_cls.build_baseline(
             definition=definition,
@@ -257,7 +259,14 @@ class PersistentSubprocessWorker:
             device=self._device,
             trace_set_root=trace_set_root,
         )
+        elapsed_ms = (time.perf_counter() - start_time) * 1000.0
         self._baselines[baseline.handle] = baseline
+        baseline_timing_lines = []
+        if baseline.timing_log:
+            baseline_timing_lines.append(baseline.timing_log)
+        baseline_timing_lines.append("[runner]")
+        baseline_timing_lines.append(f"  build_baseline_total: {elapsed_ms:.2f} ms")
+        self._baseline_timing_logs[baseline.handle] = "\n".join(baseline_timing_lines)
         return baseline.handle
 
     def run_solution(
@@ -298,14 +307,35 @@ class PersistentSubprocessWorker:
             )
 
         try:
-            self._parent_conn.send(eval_msg)
+            total_start_time = time.perf_counter()
 
+            send_start_time = time.perf_counter()
+            self._parent_conn.send(eval_msg)
+            send_elapsed_ms = (time.perf_counter() - send_start_time) * 1000.0
+
+            wait_start_time = time.perf_counter()
             if self._parent_conn.poll(timeout=cfg.timeout_seconds):
+                wait_elapsed_ms = (time.perf_counter() - wait_start_time) * 1000.0
                 try:
+                    recv_start_time = time.perf_counter()
                     response = self._parent_conn.recv()
+                    recv_elapsed_ms = (time.perf_counter() - recv_start_time) * 1000.0
+                    total_elapsed_ms = (time.perf_counter() - total_start_time) * 1000.0
 
                     if response.get("cmd") == WorkerResponse.EVALUATION.value:
                         evaluation = response["evaluation"]
+                        timing_lines = [
+                            self._baseline_timing_logs.get(baseline, "[runner]"),
+                            f"  ipc_send_eval_msg:  {send_elapsed_ms:.2f} ms",
+                            f"  ipc_wait_response:  {wait_elapsed_ms:.2f} ms",
+                            f"  ipc_recv_response:  {recv_elapsed_ms:.2f} ms",
+                            f"  run_solution_total: {total_elapsed_ms:.2f} ms",
+                        ]
+                        evaluation.log = (
+                            evaluation.log + "\n" + "\n".join(timing_lines)
+                            if evaluation.log
+                            else "\n".join(timing_lines)
+                        )
                         if evaluation.status == EvaluationStatus.PASSED:
                             self._clear_failure_record(solution.name)
                         elif evaluation.status in (
@@ -380,6 +410,7 @@ class PersistentSubprocessWorker:
 
     def release(self, baseline: BaselineHandle) -> None:
         self._baselines.pop(baseline, None)
+        self._baseline_timing_logs.pop(baseline, None)
 
     def close(self) -> None:
         self._shutdown_worker()
@@ -499,6 +530,7 @@ class PersistentRunner(Runner):
         Dict[str, Evaluation]
             Dictionary mapping solution names to their evaluations.
         """
+        workload_start_time = time.perf_counter()
         if not solutions:
             return {}
 
@@ -511,6 +543,7 @@ class PersistentRunner(Runner):
         baselines: dict[PersistentSubprocessWorker, BaselineHandle] = {}
         failed_workers: list[PersistentSubprocessWorker] = []
 
+        baseline_phase_start_time = time.perf_counter()
         with ThreadPoolExecutor(max_workers=K) as pool:
             baseline_futs = {
                 pool.submit(r.run_ref, definition, workload, config, root): r for r in selected
@@ -525,6 +558,7 @@ class PersistentRunner(Runner):
                         f"Persistent worker {r._device} failed while running reference for "
                         f"definition={definition.name} workload={workload.uuid}: {e}"
                     )
+        baseline_phase_elapsed_ms = (time.perf_counter() - baseline_phase_start_time) * 1000.0
 
         if failed_workers:
             self._handle_failed_workers(failed_workers, increment_retries=True)
@@ -540,7 +574,11 @@ class PersistentRunner(Runner):
             worker: PersistentSubprocessWorker, solution: Solution, baseline_handle: BaselineHandle
         ) -> Evaluation:
             try:
-                if not worker.is_healthy():
+                health_check_start_time = time.perf_counter()
+                worker_is_healthy = worker.is_healthy()
+                health_check_elapsed_ms = (time.perf_counter() - health_check_start_time) * 1000.0
+
+                if not worker_is_healthy:
                     logger.warning(
                         f"Worker on device {worker._device} is unhealthy, attempting restart"
                     )
@@ -571,6 +609,12 @@ class PersistentRunner(Runner):
                 eval_start_time = time.perf_counter()
                 result = worker.run_solution(solution, baseline_handle, config)
                 eval_time = time.perf_counter() - eval_start_time
+                health_check_log = (
+                    "[runner]\n" f"  health_check:       {health_check_elapsed_ms:.2f} ms"
+                )
+                result.log = (
+                    result.log + "\n" + health_check_log if result.log else health_check_log
+                )
                 logger.info(
                     f"Solution '{solution.name}' workload={workload.uuid}: "
                     f"{result.status.value} evaluation time={eval_time:.1f}s"
@@ -585,7 +629,9 @@ class PersistentRunner(Runner):
                     extra_msg=f"Unexpected error: {e}",
                 )
 
+        results: Dict[str, Evaluation] = {}
         try:
+            solutions_phase_start_time = time.perf_counter()
             with ThreadPoolExecutor(max_workers=len(selected)) as pool:
                 sol_futs: Dict[str, any] = {}
 
@@ -600,6 +646,7 @@ class PersistentRunner(Runner):
                 results: Dict[str, Evaluation] = {
                     name: fut.result() for name, fut in sol_futs.items()
                 }
+            solutions_phase_elapsed_ms = (time.perf_counter() - solutions_phase_start_time) * 1000.0
         finally:
             # Clean up baselines
             for r in selected:
@@ -608,6 +655,18 @@ class PersistentRunner(Runner):
                         r.release(baselines[r])
                     except Exception as e:
                         logger.warning(f"Failed to release baseline for device {r._device}: {e}")
+
+        workload_elapsed_ms = (time.perf_counter() - workload_start_time) * 1000.0
+        for evaluation in results.values():
+            workload_log = (
+                "[runner]\n"
+                f"  baseline_phase:     {baseline_phase_elapsed_ms:.2f} ms\n"
+                f"  solutions_phase:    {solutions_phase_elapsed_ms:.2f} ms\n"
+                f"  run_workload_total: {workload_elapsed_ms:.2f} ms"
+            )
+            evaluation.log = (
+                evaluation.log + "\n" + workload_log if evaluation.log else workload_log
+            )
 
         return results
 
@@ -673,14 +732,23 @@ def _persistent_worker_main(conn: mp.connection.Connection, device: str) -> None
 
                     try:
                         # Use registry to build/get cached solution
+                        build_start_time = time.perf_counter()
                         runnable_sol = registry.build(definition, solution)
+                        build_elapsed_ms = (time.perf_counter() - build_start_time) * 1000.0
+                        print("[worker]\n" f"  build_solution:     {build_elapsed_ms:.2f} ms")
 
+                        torch.cuda.synchronize(device)
+                        clone_start_time = time.perf_counter()
                         inputs: List[List[Any]] = [
                             [v.clone() if isinstance(v, torch.Tensor) else v for v in inp]
                             for inp in inputs_bl
                         ]
+                        torch.cuda.synchronize(device)
+                        clone_elapsed_ms = (time.perf_counter() - clone_start_time) * 1000.0
+                        print(f"  clone_inputs:       {clone_elapsed_ms:.2f} ms")
 
                         evaluator_cls = resolve_evaluator(definition)
+                        evaluate_start_time = time.perf_counter()
                         evaluation = evaluator_cls.evaluate(
                             definition=definition,
                             sol_runnable=runnable_sol,
@@ -690,6 +758,13 @@ def _persistent_worker_main(conn: mp.connection.Connection, device: str) -> None
                             cfg=cfg,
                             log_path=log_path,
                             device=device,
+                        )
+                        evaluate_elapsed_ms = (time.perf_counter() - evaluate_start_time) * 1000.0
+                        evaluate_log = (
+                            "[worker]\n" f"  evaluate_total:     {evaluate_elapsed_ms:.2f} ms"
+                        )
+                        evaluation.log = (
+                            evaluation.log + "\n" + evaluate_log if evaluation.log else evaluate_log
                         )
 
                         conn.send(

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import time
 from abc import ABC, abstractmethod
 from pathlib import Path
 from typing import Any, List, Optional, Tuple
@@ -76,6 +77,7 @@ class Evaluator(ABC):
         log_path: str,
         device: str,
     ) -> Evaluation:
+        correctness_start_time = time.perf_counter()
         correctness, evaluation = cls.check_correctness(
             definition=definition,
             sol_runnable=sol_runnable,
@@ -85,9 +87,17 @@ class Evaluator(ABC):
             log_path=log_path,
             device=device,
         )
+        correctness_elapsed_ms = (time.perf_counter() - correctness_start_time) * 1000.0
         if evaluation is not None:
+            evaluation.log = (
+                evaluation.log
+                + f"\n[evaluator]\n  check_correctness_total: {correctness_elapsed_ms:.2f} ms"
+                if evaluation.log
+                else f"[evaluator]\n  check_correctness_total: {correctness_elapsed_ms:.2f} ms"
+            )
             return evaluation
 
+        performance_start_time = time.perf_counter()
         performance, evaluation = cls.eval_performance(
             definition=definition,
             sol_runnable=sol_runnable,
@@ -97,14 +107,32 @@ class Evaluator(ABC):
             log_path=log_path,
             device=device,
         )
+        performance_elapsed_ms = (time.perf_counter() - performance_start_time) * 1000.0
 
         if evaluation is not None:
+            evaluation.log = (
+                evaluation.log
+                + "\n[evaluator]\n"
+                + f"  check_correctness_total: {correctness_elapsed_ms:.2f} ms\n"
+                + f"  eval_performance_total: {performance_elapsed_ms:.2f} ms"
+                if evaluation.log
+                else "[evaluator]\n"
+                + f"  check_correctness_total: {correctness_elapsed_ms:.2f} ms\n"
+                + f"  eval_performance_total: {performance_elapsed_ms:.2f} ms"
+            )
             return evaluation
 
-        return make_eval(
+        evaluation = make_eval(
             status=EvaluationStatus.PASSED,
             device=device,
             log_path=log_path,
             correctness=correctness,
             performance=performance,
         )
+        timing_log = (
+            "[evaluator]\n"
+            f"  check_correctness_total: {correctness_elapsed_ms:.2f} ms\n"
+            f"  eval_performance_total: {performance_elapsed_ms:.2f} ms"
+        )
+        evaluation.log = evaluation.log + "\n" + timing_log if evaluation.log else timing_log
+        return evaluation
