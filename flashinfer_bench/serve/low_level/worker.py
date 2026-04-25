@@ -11,59 +11,24 @@ import sys
 import tempfile
 import threading
 import time
-import uuid
 from typing import Literal
 
-from pydantic import BaseModel
-
+from flashinfer_bench.serve.low_level.cache import CacheEntry
 from flashinfer_bench.serve.low_level.errors import (
     ExecutionFailedError,
     InvalidProgramError,
     TimeoutError,
 )
-from flashinfer_bench.serve.low_level.executor import (
+from flashinfer_bench.serve.low_level.executor import execute_program
+from flashinfer_bench.serve.low_level.schema import (
     ErrorResult,
-    ExecuteResult,
     Program,
-    SharedMemoryBlob,
+    WorkerExecuteErrorResponse,
+    WorkerExecuteRequest,
+    WorkerExecuteSuccessResponse,
 )
 
 WorkerRuntimeStatus = Literal["idle", "busy", "restarting"]
-
-
-class WorkerExecuteRequest(BaseModel):
-    """IPC request sent from the scheduler process to a worker process."""
-
-    request_id: str
-    """Unique request identifier used to match the worker response."""
-    program: Program
-    """Typed execution program."""
-    blobs: dict[str, SharedMemoryBlob]
-    """Uploaded request blobs stored in shared memory."""
-
-
-class WorkerExecuteSuccessResponse(BaseModel):
-    """IPC response emitted by a worker after successful execution."""
-
-    request_id: str
-    """Unique request identifier used to match the original request."""
-    ok: Literal[True] = True
-    """Success discriminator for the worker response."""
-    result: ExecuteResult
-    """Structured execution result."""
-    binary_parts: dict[str, bytes]
-    """Named binary multipart payloads returned by execution."""
-
-
-class WorkerExecuteErrorResponse(BaseModel):
-    """IPC response emitted by a worker after execution failure."""
-
-    request_id: str
-    """Unique request identifier used to match the original request."""
-    ok: Literal[False] = False
-    """Failure discriminator for the worker response."""
-    error: ErrorResult
-    """Structured execution error."""
 
 
 def _flush_process_output() -> None:
@@ -154,8 +119,6 @@ def _worker_main(device: str, request_queue: mp.Queue, response_queue: mp.Queue)
     visible_device = device.split(":", 1)[1]
     os.environ["CUDA_VISIBLE_DEVICES"] = visible_device
 
-    from flashinfer_bench.serve.low_level.executor import execute_program
-
     while True:
         message = request_queue.get()
         if message is None:
@@ -167,6 +130,12 @@ def _worker_main(device: str, request_queue: mp.Queue, response_queue: mp.Queue)
         request_id = message.request_id
         program = message.program
         blobs = message.blobs
+        if message.request_transport_started_at is not None:
+            print(
+                f"TRACE request_id={request_id} span=worker_ipc.request_transport phase=end "
+                f"duration_ms={(time.perf_counter() - message.request_transport_started_at) * 1000.0:.3f}",
+                flush=True,
+            )
         stdout_file = None
         stderr_file = None
         execute_program_ms: float | None = None
@@ -176,24 +145,60 @@ def _worker_main(device: str, request_queue: mp.Queue, response_queue: mp.Queue)
         request_start_time = time.perf_counter()
 
         try:
+            print(f"TRACE request_id={request_id} span=worker_main.total phase=begin", flush=True)
             with _capture_process_output() as (stdout_file, stderr_file):
                 execute_program_start_time = time.perf_counter()
-                result, binary_parts = execute_program(program, blobs)
+                print(
+                    f"TRACE request_id={request_id} span=worker_main.execute_program phase=begin",
+                    flush=True,
+                )
+                result, binary_parts = execute_program(program, blobs, request_id=request_id)
                 execute_program_ms = (time.perf_counter() - execute_program_start_time) * 1000.0
+                print(
+                    f"TRACE request_id={request_id} span=worker_main.execute_program phase=end "
+                    f"duration_ms={execute_program_ms:.3f}",
+                    flush=True,
+                )
             read_captured_output_start_time = time.perf_counter()
+            print(
+                f"TRACE request_id={request_id} span=worker_main.read_captured_output phase=begin",
+                flush=True,
+            )
             stdout = _read_captured_output(stdout_file)
             stderr = _read_captured_output(stderr_file)
             read_captured_output_ms = (
                 time.perf_counter() - read_captured_output_start_time
             ) * 1000.0
+            print(
+                f"TRACE request_id={request_id} span=worker_main.read_captured_output phase=end "
+                f"duration_ms={read_captured_output_ms:.3f}",
+                flush=True,
+            )
             result = result.model_copy(update={"stdout": stdout, "stderr": stderr})
             response_queue_put_start_time = time.perf_counter()
+            response_transport_started_at = time.perf_counter()
+            print(
+                f"TRACE request_id={request_id} span=worker_ipc.response_transport phase=begin",
+                flush=True,
+            )
+            print(
+                f"TRACE request_id={request_id} span=worker_main.response_queue_put phase=begin",
+                flush=True,
+            )
             response_queue.put(
                 WorkerExecuteSuccessResponse(
-                    request_id=request_id, result=result, binary_parts=binary_parts
+                    request_id=request_id,
+                    response_transport_started_at=response_transport_started_at,
+                    result=result,
+                    binary_parts=binary_parts,
                 )
             )
             response_queue_put_ms = (time.perf_counter() - response_queue_put_start_time) * 1000.0
+            print(
+                f"TRACE request_id={request_id} span=worker_main.response_queue_put phase=end "
+                f"duration_ms={response_queue_put_ms:.3f}",
+                flush=True,
+            )
         except InvalidProgramError as error:
             worker_status = "invalid_program"
             read_captured_output_start_time = time.perf_counter()
@@ -203,9 +208,15 @@ def _worker_main(device: str, request_queue: mp.Queue, response_queue: mp.Queue)
                 time.perf_counter() - read_captured_output_start_time
             ) * 1000.0
             response_queue_put_start_time = time.perf_counter()
+            response_transport_started_at = time.perf_counter()
+            print(
+                f"TRACE request_id={request_id} span=worker_ipc.response_transport phase=begin",
+                flush=True,
+            )
             response_queue.put(
                 WorkerExecuteErrorResponse(
                     request_id=request_id,
+                    response_transport_started_at=response_transport_started_at,
                     error=ErrorResult(
                         error="invalid_program", message=error.message, stdout=stdout, stderr=stderr
                     ),
@@ -221,9 +232,15 @@ def _worker_main(device: str, request_queue: mp.Queue, response_queue: mp.Queue)
                 time.perf_counter() - read_captured_output_start_time
             ) * 1000.0
             response_queue_put_start_time = time.perf_counter()
+            response_transport_started_at = time.perf_counter()
+            print(
+                f"TRACE request_id={request_id} span=worker_ipc.response_transport phase=begin",
+                flush=True,
+            )
             response_queue.put(
                 WorkerExecuteErrorResponse(
                     request_id=request_id,
+                    response_transport_started_at=response_transport_started_at,
                     error=ErrorResult(
                         error="execution_failed",
                         message=error.message,
@@ -243,9 +260,15 @@ def _worker_main(device: str, request_queue: mp.Queue, response_queue: mp.Queue)
                 time.perf_counter() - read_captured_output_start_time
             ) * 1000.0
             response_queue_put_start_time = time.perf_counter()
+            response_transport_started_at = time.perf_counter()
+            print(
+                f"TRACE request_id={request_id} span=worker_ipc.response_transport phase=begin",
+                flush=True,
+            )
             response_queue.put(
                 WorkerExecuteErrorResponse(
                     request_id=request_id,
+                    response_transport_started_at=response_transport_started_at,
                     error=ErrorResult(
                         error="execution_failed", message=str(error), stdout=stdout, stderr=stderr
                     ),
@@ -261,6 +284,11 @@ def _worker_main(device: str, request_queue: mp.Queue, response_queue: mp.Queue)
                 f"execute_program_ms={execute_program_ms} "
                 f"read_captured_output_ms={read_captured_output_ms} "
                 f"response_queue_put_ms={response_queue_put_ms}",
+                flush=True,
+            )
+            print(
+                f"TRACE request_id={request_id} span=worker_main.total phase=end "
+                f"duration_ms={(time.perf_counter() - request_start_time) * 1000.0:.3f}",
                 flush=True,
             )
             if stdout_file is not None:
@@ -406,7 +434,11 @@ class LowLevelWorkerProcess:
         self.start()
 
     def execute(
-        self, program: Program, blobs: dict[str, SharedMemoryBlob], timeout_seconds: float
+        self,
+        request_id: str,
+        program: Program,
+        blobs: dict[str, CacheEntry],
+        timeout_seconds: float,
     ) -> WorkerExecuteSuccessResponse | WorkerExecuteErrorResponse:
         """Execute one request on this worker and wait for the typed IPC response.
 
@@ -415,7 +447,7 @@ class LowLevelWorkerProcess:
         program
             Validated low-level program to execute.
         blobs
-            Uploaded request blobs stored in shared memory and keyed by blob hash.
+            Uploaded request blobs stored in the server cache and keyed by blob hash.
         timeout_seconds
             Effective timeout in seconds for the request.
 
@@ -424,33 +456,57 @@ class LowLevelWorkerProcess:
         WorkerExecuteSuccessResponse | WorkerExecuteErrorResponse
             Typed IPC response returned by the worker process.
         """
-        request_id = uuid.uuid4().hex
-        request_message = WorkerExecuteRequest(request_id=request_id, program=program, blobs=blobs)
+        request_transport_started_at = time.perf_counter()
+        request_message = WorkerExecuteRequest(
+            request_id=request_id,
+            request_transport_started_at=request_transport_started_at,
+            program=program,
+            blobs=blobs,
+        )
         request_start_time = time.perf_counter()
         request_queue_put_ms: float | None = None
         response_wait_ms: float | None = None
-        response_validate_ms: float | None = None
         status = "ok"
         with self._lock:
             self._busy = True
             try:
                 request_queue_put_start_time = time.perf_counter()
+                print(
+                    f"TRACE request_id={request_id} span=worker_ipc.total phase=begin", flush=True
+                )
+                print(
+                    f"TRACE request_id={request_id} span=worker_ipc.request_queue_put phase=begin",
+                    flush=True,
+                )
+                print(
+                    f"TRACE request_id={request_id} span=worker_ipc.request_transport phase=begin",
+                    flush=True,
+                )
                 self._request_queue.put(request_message)
                 request_queue_put_ms = (time.perf_counter() - request_queue_put_start_time) * 1000.0
+                print(
+                    f"TRACE request_id={request_id} span=worker_ipc.request_queue_put phase=end "
+                    f"duration_ms={request_queue_put_ms:.3f}",
+                    flush=True,
+                )
                 response_wait_start_time = time.perf_counter()
+                print(
+                    f"TRACE request_id={request_id} span=worker_ipc.response_wait phase=begin",
+                    flush=True,
+                )
                 response = self._response_queue.get(timeout=timeout_seconds)
                 response_wait_ms = (time.perf_counter() - response_wait_start_time) * 1000.0
-                if not isinstance(
-                    response, (WorkerExecuteSuccessResponse, WorkerExecuteErrorResponse)
-                ):
-                    response_validate_start_time = time.perf_counter()
-                    if response.get("ok"):
-                        response = WorkerExecuteSuccessResponse.model_validate(response)
-                    else:
-                        response = WorkerExecuteErrorResponse.model_validate(response)
-                    response_validate_ms = (
-                        time.perf_counter() - response_validate_start_time
-                    ) * 1000.0
+                print(
+                    f"TRACE request_id={request_id} span=worker_ipc.response_wait phase=end "
+                    f"duration_ms={response_wait_ms:.3f}",
+                    flush=True,
+                )
+                if response.response_transport_started_at is not None:
+                    print(
+                        f"TRACE request_id={request_id} span=worker_ipc.response_transport phase=end "
+                        f"duration_ms={(time.perf_counter() - response.response_transport_started_at) * 1000.0:.3f}",
+                        flush=True,
+                    )
                 if response.request_id != request_id:
                     raise RuntimeError("Mismatched worker response")
                 return response
@@ -465,102 +521,12 @@ class LowLevelWorkerProcess:
                     f"status={status} "
                     f"total_execute_ms={(time.perf_counter() - request_start_time) * 1000.0:.3f} "
                     f"request_queue_put_ms={request_queue_put_ms} "
-                    f"response_wait_ms={response_wait_ms} "
-                    f"response_validate_ms={response_validate_ms}",
+                    f"response_wait_ms={response_wait_ms} ",
+                    flush=True,
+                )
+                print(
+                    f"TRACE request_id={request_id} span=worker_ipc.total phase=end "
+                    f"duration_ms={(time.perf_counter() - request_start_time) * 1000.0:.3f}",
                     flush=True,
                 )
                 self._busy = False
-
-
-class LowLevelScheduler:
-    """Pick an idle worker and execute requests synchronously."""
-
-    def __init__(self, devices: list[str], default_timeout_seconds: int):
-        """Initialize the scheduler and spawn one worker per device.
-
-        Parameters
-        ----------
-        devices
-            CUDA device strings assigned to worker processes.
-        default_timeout_seconds
-            Default request timeout in seconds.
-
-        Returns
-        -------
-        None
-            This constructor initializes internal scheduler state in place.
-        """
-        self.default_timeout_seconds = default_timeout_seconds
-        self._workers = [LowLevelWorkerProcess(device=device) for device in devices]
-        self._condition = threading.Condition()
-        self._next_worker_index = 0
-
-    def close(self) -> None:
-        """Stop all managed workers.
-
-        Returns
-        -------
-        None
-            This method releases all managed worker processes in place.
-        """
-        for worker in self._workers:
-            worker.close()
-
-    def execute(
-        self, program: Program, timeout_seconds: float | None, blobs: dict[str, SharedMemoryBlob]
-    ) -> WorkerExecuteSuccessResponse | WorkerExecuteErrorResponse:
-        """Dispatch one request to an idle worker with the effective timeout.
-
-        Parameters
-        ----------
-        program
-            Validated low-level program to execute.
-        timeout_seconds
-            Optional per-request timeout override in seconds.
-        blobs
-            Uploaded request blobs stored in shared memory and keyed by blob hash.
-
-        Returns
-        -------
-        WorkerExecuteSuccessResponse | WorkerExecuteErrorResponse
-            Typed IPC response returned by the selected worker.
-        """
-        effective_timeout = timeout_seconds or self.default_timeout_seconds
-
-        wait_worker_start_time = time.perf_counter()
-        worker = self._acquire_worker()
-        wait_worker_ms = (time.perf_counter() - wait_worker_start_time) * 1000.0
-        try:
-            worker_execute_start_time = time.perf_counter()
-            return worker.execute(
-                program=program, blobs=blobs, timeout_seconds=float(effective_timeout)
-            )
-        finally:
-            print(
-                "SCHEDULER_TIMING "
-                f"selected_gpu_id={worker.gpu_id} "
-                f"effective_timeout_seconds={float(effective_timeout)} "
-                f"wait_worker_ms={wait_worker_ms:.3f} "
-                f"worker_execute_ms={(time.perf_counter() - worker_execute_start_time) * 1000.0:.3f}",
-                flush=True,
-            )
-            with self._condition:
-                self._condition.notify_all()
-
-    def _acquire_worker(self) -> LowLevelWorkerProcess:
-        """Block until one worker becomes idle and return it.
-
-        Returns
-        -------
-        LowLevelWorkerProcess
-            Idle worker selected for the next request.
-        """
-        with self._condition:
-            while True:
-                for offset in range(len(self._workers)):
-                    worker_index = (self._next_worker_index + offset) % len(self._workers)
-                    worker = self._workers[worker_index]
-                    if worker.status == "idle":
-                        self._next_worker_index = (worker_index + 1) % len(self._workers)
-                        return worker
-                self._condition.wait(timeout=0.1)

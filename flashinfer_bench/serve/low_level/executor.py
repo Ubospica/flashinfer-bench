@@ -3,243 +3,46 @@
 from __future__ import annotations
 
 import importlib.util
+import math
 import sys
 import tempfile
 import uuid
 from dataclasses import dataclass, field
-from multiprocessing import shared_memory
 from pathlib import Path
 from time import perf_counter
-from typing import Any, Dict, Literal, Tuple, Union
+from typing import Any, Dict, Tuple
 
-import numpy as np
 import torch
 import tvm_ffi
-from pydantic import BaseModel, ValidationError
 from tvm_ffi.registry import list_global_func_names
 
+from flashinfer_bench.serve.low_level.cache import CacheEntry, ShmUtils
 from flashinfer_bench.serve.low_level.errors import ExecutionFailedError, InvalidProgramError
-from flashinfer_bench.utils import dtype_str_to_torch_dtype
-
-# ---------------------------------------------------------------------------
-# Instruction schemas
-# ---------------------------------------------------------------------------
-
-SUPPORTED_DTYPES = Literal[
-    "float16", "bfloat16", "float32", "float64", "int8", "int16", "int32", "int64", "uint8", "bool"
-]
-
-
-class RegisterRef(BaseModel):
-    """Reference a value previously stored in the register file."""
-
-    r: int
-    """Register index to read from."""
-
-
-Operand = Union[RegisterRef, int, float, str, bool, list, None]
-
-
-class UploadPythonModuleInstruction(BaseModel):
-    """Import a Python module blob into the worker process."""
-
-    op: Literal["upload_python_module"]
-    """Instruction opcode."""
-    blob: str
-    """Blob key referencing the uploaded Python module source."""
-
-
-class UploadFfiModuleInstruction(BaseModel):
-    """Load a TVM FFI shared library blob and store its module handle."""
-
-    op: Literal["upload_ffi_module"]
-    """Instruction opcode."""
-    blob: str
-    """Blob key referencing the uploaded shared library bytes."""
-    dst: int
-    """Destination register for the loaded FFI module handle."""
-
-
-class UploadTensorInstruction(BaseModel):
-    """Load a tensor blob onto the worker GPU and store it in a register."""
-
-    op: Literal["upload_tensor"]
-    """Instruction opcode."""
-    dst: int
-    """Destination register for the uploaded tensor."""
-    blob: str
-    """Blob key referencing the raw tensor bytes."""
-    shape: list[int]
-    """Tensor shape in row-major order."""
-    dtype: SUPPORTED_DTYPES
-    """Tensor dtype name."""
-
-
-class CallInstruction(BaseModel):
-    """Call a function with literal operands or register references."""
-
-    op: Literal["call"]
-    """Instruction opcode."""
-    func: str
-    """Function name to invoke."""
-    args: list[Operand]
-    """Function arguments in call order."""
-    dst: int | None = None
-    """Destination register for the return value."""
-    module: RegisterRef | None = None
-    """Optional register reference to a module handle used for function lookup."""
-
-
-class ReturnInstruction(BaseModel):
-    """Expose a register value in the final response payload."""
-
-    op: Literal["return"]
-    """Instruction opcode."""
-    reg: int
-    """Register index to export."""
-    key: str
-    """Response key used in the returns map."""
-
-
-Instruction = Union[
-    UploadPythonModuleInstruction,
-    UploadFfiModuleInstruction,
-    UploadTensorInstruction,
+from flashinfer_bench.serve.low_level.schema import (
+    BytesReturnValue,
     CallInstruction,
+    ExecuteResult,
+    Instruction,
+    JsonReturnValue,
+    Program,
+    RegisterRef,
     ReturnInstruction,
-]
-
-
-class Program(BaseModel):
-    """Executable low-level program independent of HTTP request metadata."""
-
-    instructions: list[Instruction]
-    """Ordered instruction sequence to execute."""
-
-
-def parse_program(raw: dict) -> Program:
-    """Parse and validate a raw JSON dict into a typed `Program`.
-
-    Parameters
-    ----------
-    raw
-        Raw JSON object decoded from the request payload.
-
-    Returns
-    -------
-    Program
-        Validated execution program.
-    """
-    try:
-        return Program.model_validate(raw)
-    except ValidationError as error:
-        raise InvalidProgramError(str(error)) from error
-
-
-# ---------------------------------------------------------------------------
-# Response schemas
-# ---------------------------------------------------------------------------
-
-
-class TensorReturnValue(BaseModel):
-    """Tensor return value described by metadata plus a binary blob part."""
-
-    type: Literal["tensor"] = "tensor"
-    """Return value kind."""
-    dtype: SUPPORTED_DTYPES
-    """Tensor dtype name."""
-    shape: list[int]
-    """Tensor shape in row-major order."""
-    blob: str
-    """Multipart part name containing the raw tensor bytes."""
-
-
-class BytesReturnValue(BaseModel):
-    """Opaque bytes return value stored in a multipart blob part."""
-
-    type: Literal["bytes"] = "bytes"
-    """Return value kind."""
-    blob: str
-    """Multipart part name containing the raw bytes."""
-
-
-class JsonReturnValue(BaseModel):
-    """JSON-serializable return value embedded directly in the result payload."""
-
-    type: Literal["json"] = "json"
-    """Return value kind."""
-    value: Any
-    """JSON-serializable return value."""
-
-
-ReturnValue = Union[TensorReturnValue, BytesReturnValue, JsonReturnValue]
-
-
-class ExecuteResult(BaseModel):
-    """Successful execution result returned in the `result` multipart field."""
-
-    status: Literal["ok"] = "ok"
-    """Execution status."""
-    returns: dict[str, ReturnValue]
-    """Named return values exported by `return` instructions."""
-    elapsed_ms: float
-    """Wall-clock execution time in milliseconds."""
-    stdout: str | None = None
-    """Captured standard output from the worker process."""
-    stderr: str | None = None
-    """Captured standard error from the worker process."""
-
-
-class ErrorResult(BaseModel):
-    """Structured execution error returned as JSON when the request fails."""
-
-    status: Literal["error"] = "error"
-    """Execution status."""
-    error: str
-    """Stable machine-readable error code."""
-    message: str | None = None
-    """Human-readable error summary."""
-    instruction_index: int | None = None
-    """Zero-based instruction index associated with the failure, when available."""
-    timeout_seconds: float | None = None
-    """Effective timeout that was exceeded, when the error is a timeout."""
-    stdout: str | None = None
-    """Captured standard output before the failure."""
-    stderr: str | None = None
-    """Captured standard error before the failure."""
-
-
-class SharedMemoryBlob(BaseModel):
-    """Shared-memory blob metadata passed from the frontend to a worker."""
-
-    name: str
-    """Operating-system shared-memory object name."""
-    size: int
-    """Logical blob size in bytes."""
-
-
-# ---------------------------------------------------------------------------
-# Dtype mappings
-# ---------------------------------------------------------------------------
-
-_DTYPE_TO_NUMPY: Dict[str, np.dtype] = {
-    "float16": np.dtype(np.float16),
-    "bfloat16": np.dtype(np.uint16),
-    "float32": np.dtype(np.float32),
-    "float64": np.dtype(np.float64),
-    "int8": np.dtype(np.int8),
-    "int16": np.dtype(np.int16),
-    "int32": np.dtype(np.int32),
-    "int64": np.dtype(np.int64),
-    "uint8": np.dtype(np.uint8),
-    "bool": np.dtype(np.bool_),
-}
+    ReturnValue,
+    TensorReturnValue,
+    UploadFfiModuleInstruction,
+    UploadPythonModuleInstruction,
+    UploadTensorInstruction,
+)
+from flashinfer_bench.utils import dtype_str_to_torch_dtype
 
 _TORCH_DTYPE_TO_NAME: Dict[torch.dtype, str] = {
     torch.float16: "float16",
     torch.bfloat16: "bfloat16",
     torch.float32: "float32",
     torch.float64: "float64",
+    torch.float8_e4m3fn: "float8_e4m3fn",
+    torch.float8_e5m2: "float8_e5m2",
+    torch.float4_e2m1fn_x2: "float4_e2m1",
     torch.int8: "int8",
     torch.int16: "int16",
     torch.int32: "int32",
@@ -265,10 +68,8 @@ class RequestContext:
     """Imported Python module objects kept alive for the current request."""
     loaded_python_module_names: list[str] = field(default_factory=list)
     """Temporary module names inserted into `sys.modules` for uploaded Python modules."""
-    blobs: Dict[str, SharedMemoryBlob] = field(default_factory=dict)
+    blobs: Dict[str, CacheEntry] = field(default_factory=dict)
     """Uploaded request blobs addressable by blob hash."""
-    attached_shared_memories: Dict[str, shared_memory.SharedMemory] = field(default_factory=dict)
-    """Worker-local shared-memory attachments opened for uploaded blobs."""
 
     def get_register(self, register_index: int) -> Any:
         """Read a value from the request register file.
@@ -330,19 +131,17 @@ class RequestContext:
         Returns
         -------
         memoryview
-            Shared-memory view spanning the logical blob bytes.
+            Memory-mapped view spanning the logical blob bytes.
         """
         if blob_hash not in self.blobs:
             raise InvalidProgramError(f"Missing blob: {blob_hash}")
         blob = self.blobs[blob_hash]
-        if blob_hash not in self.attached_shared_memories:
-            try:
-                self.attached_shared_memories[blob_hash] = shared_memory.SharedMemory(
-                    name=blob.name
-                )
-            except FileNotFoundError as error:
-                raise InvalidProgramError(f"Missing shared-memory blob: {blob_hash}") from error
-        return self.attached_shared_memories[blob_hash].buf[: blob.size]
+        if blob.size == 0:
+            return memoryview(b"")
+        try:
+            return ShmUtils.read(blob.path)[: blob.size]
+        except FileNotFoundError as error:
+            raise InvalidProgramError(f"Missing blob file: {blob_hash}") from error
 
     def read_blob_bytes(self, blob_hash: str) -> bytes:
         """Copy one uploaded blob into an immutable bytes object.
@@ -357,6 +156,11 @@ class RequestContext:
         bytes
             Immutable copy of the requested blob payload.
         """
+        if blob_hash not in self.blobs:
+            raise InvalidProgramError(f"Missing blob: {blob_hash}")
+        blob = self.blobs[blob_hash]
+        if blob.size == 0:
+            return b""
         blob_buffer = self.get_blob_buffer(blob_hash)
         try:
             return bytes(blob_buffer)
@@ -382,9 +186,6 @@ class RequestContext:
             sys.modules.pop(module_name, None)
         self.loaded_python_modules.clear()
         self.loaded_python_module_names.clear()
-        for attached_shared_memory in self.attached_shared_memories.values():
-            attached_shared_memory.close()
-        self.attached_shared_memories.clear()
         self.blobs.clear()
         self.registered_function_names.clear()
 
@@ -395,7 +196,7 @@ class RequestContext:
 
 
 def execute_program(
-    program: Program, blobs: Dict[str, SharedMemoryBlob]
+    program: Program, blobs: Dict[str, CacheEntry], request_id: str | None = None
 ) -> Tuple[ExecuteResult, Dict[str, bytes]]:
     """Execute a validated program against request blobs.
 
@@ -404,7 +205,7 @@ def execute_program(
     program
         Validated low-level program to execute.
     blobs
-        Uploaded request blobs stored in shared memory and keyed by blob hash.
+        Uploaded request blobs stored in the server cache and keyed by blob hash.
 
     Returns
     -------
@@ -419,27 +220,60 @@ def execute_program(
     elapsed_ms: float | None = None
     cleanup_ms: float | None = None
     try:
+        if request_id is not None:
+            print(f"TRACE request_id={request_id} span=executor.total phase=begin", flush=True)
         with tempfile.TemporaryDirectory(prefix="fib_low_level_worker_") as temporary_directory:
             tmp_dir = Path(temporary_directory)
             start_time = perf_counter()
             instruction_loop_start_time = perf_counter()
+            if request_id is not None:
+                print(
+                    f"TRACE request_id={request_id} span=executor.instruction_loop phase=begin",
+                    flush=True,
+                )
             for instruction_index, instruction in enumerate(program.instructions):
                 _execute_instruction(
                     context, tmp_dir, instruction, instruction_index, returned_values
                 )
             instruction_loop_ms = (perf_counter() - instruction_loop_start_time) * 1000.0
+            if request_id is not None:
+                print(
+                    f"TRACE request_id={request_id} span=executor.instruction_loop phase=end "
+                    f"duration_ms={instruction_loop_ms:.3f}",
+                    flush=True,
+                )
             serialize_returns_start_time = perf_counter()
+            if request_id is not None:
+                print(
+                    f"TRACE request_id={request_id} span=executor.serialize_returns phase=begin",
+                    flush=True,
+                )
             returns, binary_parts = _serialize_returns(returned_values)
             serialize_returns_ms = (perf_counter() - serialize_returns_start_time) * 1000.0
+            if request_id is not None:
+                print(
+                    f"TRACE request_id={request_id} span=executor.serialize_returns phase=end "
+                    f"duration_ms={serialize_returns_ms:.3f}",
+                    flush=True,
+                )
             elapsed_ms = (perf_counter() - start_time) * 1000.0
             result = ExecuteResult(returns=returns, elapsed_ms=elapsed_ms)
             return result, binary_parts
     finally:
         cleanup_start_time = perf_counter()
+        if request_id is not None:
+            print(f"TRACE request_id={request_id} span=executor.cleanup phase=begin", flush=True)
         context.cleanup()
         cleanup_ms = (perf_counter() - cleanup_start_time) * 1000.0
+        if request_id is not None:
+            print(
+                f"TRACE request_id={request_id} span=executor.cleanup phase=end "
+                f"duration_ms={cleanup_ms:.3f}",
+                flush=True,
+            )
         print(
             "EXECUTOR_TIMING "
+            f"request_id={request_id} "
             f"total_execute_program_ms={(perf_counter() - execute_program_start_time) * 1000.0:.3f} "
             f"elapsed_ms={elapsed_ms} "
             f"instruction_loop_ms={instruction_loop_ms} "
@@ -447,6 +281,12 @@ def execute_program(
             f"cleanup_ms={cleanup_ms}",
             flush=True,
         )
+        if request_id is not None:
+            print(
+                f"TRACE request_id={request_id} span=executor.total phase=end "
+                f"duration_ms={(perf_counter() - execute_program_start_time) * 1000.0:.3f}",
+                flush=True,
+            )
 
 
 def _execute_instruction(
@@ -661,22 +501,16 @@ def _execute_upload_tensor(context: RequestContext, instruction: UploadTensorIns
         This function mutates the request context in place.
     """
     blob_buffer = context.get_blob_buffer(instruction.blob)
-    numpy_dtype = _DTYPE_TO_NUMPY[instruction.dtype]
-    expected_nbytes = int(np.prod(instruction.shape, dtype=np.int64)) * numpy_dtype.itemsize
+    torch_dtype = dtype_str_to_torch_dtype(instruction.dtype)
+    expected_nbytes = math.prod(instruction.shape) * torch_dtype.itemsize
     try:
         if len(blob_buffer) != expected_nbytes:
             raise InvalidProgramError(
                 f"upload_tensor blob size mismatch: expected {expected_nbytes} bytes, got {len(blob_buffer)}"
             )
 
-        numpy_array = (
-            np.frombuffer(blob_buffer, dtype=numpy_dtype).copy().reshape(instruction.shape)
-        )
-        torch_dtype = dtype_str_to_torch_dtype(instruction.dtype)
-        if instruction.dtype == "bfloat16":
-            tensor = torch.from_numpy(numpy_array.view(np.int16)).view(torch.bfloat16)
-        else:
-            tensor = torch.from_numpy(numpy_array).to(dtype=torch_dtype)
+        tensor = torch.frombuffer(blob_buffer, dtype=torch_dtype)
+        tensor = tensor.view(instruction.shape)
         tensor = tensor.to("cuda:0")
         context.set_register(instruction.dst, tensor)
     finally:
@@ -810,7 +644,7 @@ def _serialize_returns(
         if isinstance(value, torch.Tensor):
             tensor = value.detach().contiguous().cpu()
             part_name = f"return:{key}"
-            binary_parts[part_name] = tensor.numpy().tobytes()
+            binary_parts[part_name] = bytes(tensor.untyped_storage())
             returns[key] = TensorReturnValue(
                 dtype=_TORCH_DTYPE_TO_NAME[tensor.dtype], shape=list(tensor.shape), blob=part_name
             )
